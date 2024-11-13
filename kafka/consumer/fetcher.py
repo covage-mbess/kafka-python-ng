@@ -54,7 +54,8 @@ class Fetcher:
         'iterator_refetch_records': 1,  # undocumented -- interface may change
         'metric_group_prefix': 'consumer',
         'api_version': (0, 8, 0),
-        'retry_backoff_ms': 100
+        'retry_backoff_ms': 100,
+        'logger': None
     }
 
     def __init__(self, client, subscriptions, metrics, **configs):
@@ -99,6 +100,7 @@ class Fetcher:
             if key in configs:
                 self.config[key] = configs[key]
 
+        self._logger = self.config['logger'].bind(logger_name="Fetcher") or logging.getLogger(__name__)
         self._client = client
         self._subscriptions = subscriptions
         self._completed_fetches = collections.deque()  # Unparsed responses
@@ -118,7 +120,7 @@ class Fetcher:
         futures = []
         for node_id, request in self._create_fetch_requests().items():
             if self._client.ready(node_id):
-                log.debug("Sending FetchRequest to node %s", node_id)
+                self._logger.debug("Sending FetchRequest to node %s", node_id)
                 future = self._client.send(node_id, request, wakeup=False)
                 future.add_callback(self._handle_fetch_response, request, time.time())
                 future.add_errback(log.error, 'Fetch to node %s failed: %s', node_id)
@@ -165,11 +167,11 @@ class Fetcher:
         # reset the fetch position to the committed position
         for tp in partitions:
             if not self._subscriptions.is_assigned(tp):
-                log.warning("partition %s is not assigned - skipping offset"
+                self._logger.warning("partition %s is not assigned - skipping offset"
                             " update", tp)
                 continue
             elif self._subscriptions.is_fetchable(tp):
-                log.warning("partition %s is still fetchable -- skipping offset"
+                self._logger.warning("partition %s is still fetchable -- skipping offset"
                             " update", tp)
                 continue
 
@@ -182,7 +184,7 @@ class Fetcher:
                 self._reset_offset(tp)
             else:
                 committed = self._subscriptions.assignment[tp].committed.offset
-                log.debug("Resetting offset for partition %s to the committed"
+                self._logger.debug("Resetting offset for partition %s to the committed"
                           " offset %s", tp, committed)
                 self._subscriptions.seek(tp, committed)
 
@@ -228,7 +230,7 @@ class Fetcher:
         else:
             raise NoOffsetForPartitionError(partition)
 
-        log.debug("Resetting offset for partition %s to %s offset.",
+        self._logger.debug("Resetting offset for partition %s to %s offset.",
                   partition, strategy)
         offsets = self._retrieve_offsets({partition: timestamp})
 
@@ -240,7 +242,7 @@ class Fetcher:
             if self._subscriptions.is_assigned(partition):
                 self._subscriptions.seek(partition, offset)
         else:
-            log.debug(f"Could not find offset for partition {partition} since it is probably deleted")
+            self._logger.debug(f"Could not find offset for partition {partition} since it is probably deleted")
 
     def _retrieve_offsets(self, timestamps, timeout_ms=float("inf")):
         """Fetch offset for each partition passed in ``timestamps`` map.
@@ -289,10 +291,10 @@ class Fetcher:
                 # Issue #1780
                 # Recheck partition existence after after a successful metadata refresh
                 if refresh_future.succeeded() and isinstance(future.exception, Errors.StaleMetadata):
-                    log.debug("Stale metadata was raised, and we now have an updated metadata. Rechecking partition existence")
+                    self._logger.debug("Stale metadata was raised, and we now have an updated metadata. Rechecking partition existence")
                     unknown_partition = future.exception.args[0]  # TopicPartition from StaleMetadata
                     if self._client.cluster.leader_for_partition(unknown_partition) is None:
-                        log.debug(f"Removed partition {unknown_partition} from offsets retrieval")
+                        self._logger.debug(f"Removed partition {unknown_partition} from offsets retrieval")
                         timestamps.pop(unknown_partition)
             else:
                 time.sleep(self.config['retry_backoff_ms'] / 1000.0)
@@ -354,7 +356,7 @@ class Fetcher:
         if not self._subscriptions.is_assigned(tp):
             # this can happen when a rebalance happened before
             # fetched records are returned to the consumer's poll call
-            log.debug("Not returning fetched records for partition %s"
+            self._logger.debug("Not returning fetched records for partition %s"
                       " since it is no longer assigned", tp)
         else:
             # note that the position should always be available
@@ -363,7 +365,7 @@ class Fetcher:
             if not self._subscriptions.is_fetchable(tp):
                 # this can happen when a partition is paused before
                 # fetched records are returned to the consumer's poll call
-                log.debug("Not returning fetched records for assigned partition"
+                self._logger.debug("Not returning fetched records for assigned partition"
                           " %s since it is no longer fetchable", tp)
 
             elif fetch_offset == position:
@@ -371,7 +373,7 @@ class Fetcher:
                 part_records = part.take(max_records)
                 next_offset = part_records[-1].offset + 1
 
-                log.log(0, "Returning fetched records at offset %d for assigned"
+                self._logger.log(0, "Returning fetched records at offset %d for assigned"
                            " partition %s and update position to %s", position,
                            tp, next_offset)
 
@@ -385,7 +387,7 @@ class Fetcher:
             else:
                 # these records aren't next in line based on the last consumed
                 # position, ignore them they must be from an obsolete request
-                log.debug("Ignoring fetched records for %s at offset %s since"
+                self._logger.debug("Ignoring fetched records for %s at offset %s since"
                           " the current position is %d", tp, part.fetch_offset,
                           position)
 
@@ -421,7 +423,7 @@ class Fetcher:
                 # this should catch assignment changes, pauses
                 # and resets via seek_to_beginning / seek_to_end
                 if not self._subscriptions.is_fetchable(tp):
-                    log.debug("Not returning fetched records for partition %s"
+                    self._logger.debug("Not returning fetched records for partition %s"
                               " since it is no longer fetchable", tp)
                     self._next_partition_records = None
                     break
@@ -431,14 +433,14 @@ class Fetcher:
                 # wait for a new fetch response that aligns with the
                 # new seek position
                 elif self._subscriptions.assignment[tp].drop_pending_message_set:
-                    log.debug("Skipping remainder of message set for partition %s", tp)
+                    self._logger.debug("Skipping remainder of message set for partition %s", tp)
                     self._subscriptions.assignment[tp].drop_pending_message_set = False
                     self._next_partition_records = None
                     break
 
                 # Compressed messagesets may include earlier messages
                 elif msg.offset < self._subscriptions.assignment[tp].position:
-                    log.debug("Skipping message offset: %s (expecting %s)",
+                    self._logger.debug("Skipping message offset: %s (expecting %s)",
                               msg.offset,
                               self._subscriptions.assignment[tp].position)
                     continue
@@ -484,7 +486,7 @@ class Fetcher:
         # caught by the generator. We want all exceptions to be raised
         # back to the user. See Issue 545
         except StopIteration as e:
-            log.exception('StopIteration raised unpacking messageset')
+            self._logger.exception('StopIteration raised unpacking messageset')
             raise RuntimeError('StopIteration raised unpacking messageset')
 
     def __iter__(self):  # pylint: disable=non-iterator-returned
@@ -522,11 +524,11 @@ class Fetcher:
             node_id = self._client.cluster.leader_for_partition(partition)
             if node_id is None:
                 self._client.add_topic(partition.topic)
-                log.debug("Partition %s is unknown for fetching offset,"
+                self._logger.debug("Partition %s is unknown for fetching offset,"
                           " wait for metadata refresh", partition)
                 return Future().failure(Errors.StaleMetadata(partition))
             elif node_id == -1:
-                log.debug("Leader for partition %s unavailable for fetching "
+                self._logger.debug("Leader for partition %s unavailable for fetching "
                           "offset, wait for metadata refresh", partition)
                 return Future().failure(
                     Errors.LeaderNotAvailableError(partition))
@@ -604,13 +606,13 @@ class Fetcher:
                             offset = UNKNOWN_OFFSET
                         else:
                             offset = offsets[0]
-                        log.debug("Handling v0 ListOffsetResponse response for %s. "
+                        self._logger.debug("Handling v0 ListOffsetResponse response for %s. "
                                   "Fetched offset %s", partition, offset)
                         if offset != UNKNOWN_OFFSET:
                             timestamp_offset_map[partition] = (offset, None)
                     else:
                         timestamp, offset = partition_info[2:]
-                        log.debug("Handling ListOffsetResponse response for %s. "
+                        self._logger.debug("Handling ListOffsetResponse response for %s. "
                                   "Fetched offset %s, timestamp %s",
                                   partition, offset, timestamp)
                         if offset != UNKNOWN_OFFSET:
@@ -618,23 +620,23 @@ class Fetcher:
                 elif error_type is Errors.UnsupportedForMessageFormatError:
                     # The message format on the broker side is before 0.10.0,
                     # we simply put None in the response.
-                    log.debug("Cannot search by timestamp for partition %s because the"
+                    self._logger.debug("Cannot search by timestamp for partition %s because the"
                               " message format version is before 0.10.0", partition)
                 elif error_type is Errors.NotLeaderForPartitionError:
-                    log.debug("Attempt to fetch offsets for partition %s failed due"
+                    self._logger.debug("Attempt to fetch offsets for partition %s failed due"
                               " to obsolete leadership information, retrying.",
                               partition)
                     future.failure(error_type(partition))
                     return
                 elif error_type is Errors.UnknownTopicOrPartitionError:
-                    log.warning("Received unknown topic or partition error in ListOffset "
+                    self._logger.warning("Received unknown topic or partition error in ListOffset "
                              "request for partition %s. The topic/partition " +
                              "may not exist or the user may not have Describe access "
                              "to it.", partition)
                     future.failure(error_type(partition))
                     return
                 else:
-                    log.warning("Attempt to fetch offsets for partition %s failed due to:"
+                    self._logger.warning("Attempt to fetch offsets for partition %s failed due to:"
                                 " %s", partition, error_type)
                     future.failure(error_type(partition))
                     return
@@ -671,7 +673,7 @@ class Fetcher:
             if self._subscriptions.assignment[partition].last_offset_from_message_batch:
                 next_offset_from_batch_header = self._subscriptions.assignment[partition].last_offset_from_message_batch + 1
                 if next_offset_from_batch_header > self._subscriptions.assignment[partition].position:
-                    log.debug(
+                    self._logger.debug(
                         "Advance position for partition %s from %s to %s (last message batch location plus one)"
                         " to correct for deleted compacted messages",
                         partition, self._subscriptions.assignment[partition].position, next_offset_from_batch_header)
@@ -681,7 +683,7 @@ class Fetcher:
 
             # fetch if there is a leader and no in-flight requests
             if node_id is None or node_id == -1:
-                log.debug("No leader found for partition %s."
+                self._logger.debug("No leader found for partition %s."
                           " Requesting metadata update", partition)
                 self._client.cluster.request_update()
 
@@ -692,10 +694,10 @@ class Fetcher:
                     self.config['max_partition_fetch_bytes']
                 )
                 fetchable[node_id][partition.topic].append(partition_info)
-                log.debug("Adding fetch request for partition %s at offset %d",
+                self._logger.debug("Adding fetch request for partition %s at offset %d",
                           partition, position)
             else:
-                log.log(0, "Skipping fetch for partition %s because there is an inflight request to node %s",
+                self._logger.log(0, "Skipping fetch for partition %s because there is an inflight request to node %s",
                         partition, node_id)
 
         if self.config['api_version'] >= (0, 11, 0):
@@ -788,7 +790,7 @@ class Fetcher:
             if not self._subscriptions.is_fetchable(tp):
                 # this can happen when a rebalance happened or a partition
                 # consumption paused while fetch is still in-flight
-                log.debug("Ignoring fetched records for partition %s"
+                self._logger.debug("Ignoring fetched records for partition %s"
                           " since it is no longer fetchable", tp)
 
             elif error_type is Errors.NoError:
@@ -800,7 +802,7 @@ class Fetcher:
                 # earlier (e.g., compressed messages) or later (e.g., compacted topic)
                 position = self._subscriptions.assignment[tp].position
                 if position is None or position != fetch_offset:
-                    log.debug("Discarding fetch response for partition %s"
+                    self._logger.debug("Discarding fetch response for partition %s"
                               " since its offset %d does not match the"
                               " expected offset %d", tp, fetch_offset,
                               position)
@@ -808,7 +810,7 @@ class Fetcher:
 
                 records = MemoryRecords(completed_fetch.partition_data[-1])
                 if records.has_next():
-                    log.debug("Adding fetched record for partition %s with"
+                    self._logger.debug("Adding fetched record for partition %s with"
                               " offset %d to buffered record list", tp,
                               position)
                     unpacked = list(self._unpack_message_set(tp, records))
@@ -840,20 +842,20 @@ class Fetcher:
             elif error_type is Errors.OffsetOutOfRangeError:
                 position = self._subscriptions.assignment[tp].position
                 if position is None or position != fetch_offset:
-                    log.debug("Discarding stale fetch response for partition %s"
+                    self._logger.debug("Discarding stale fetch response for partition %s"
                               " since the fetched offset %d does not match the"
                               " current offset %d", tp, fetch_offset, position)
                 elif self._subscriptions.has_default_offset_reset_policy():
-                    log.info("Fetch offset %s is out of range for topic-partition %s", fetch_offset, tp)
+                    self._logger.info("Fetch offset %s is out of range for topic-partition %s", fetch_offset, tp)
                     self._subscriptions.need_offset_reset(tp)
                 else:
                     raise Errors.OffsetOutOfRangeError({tp: fetch_offset})
 
             elif error_type is Errors.TopicAuthorizationFailedError:
-                log.warning("Not authorized to read from topic %s.", tp.topic)
+                self._logger.warning("Not authorized to read from topic %s.", tp.topic)
                 raise Errors.TopicAuthorizationFailedError(set(tp.topic))
             elif error_type is Errors.UnknownError:
-                log.warning("Unknown error fetching data for topic-partition %s", tp)
+                self._logger.warning("Unknown error fetching data for topic-partition %s", tp)
             else:
                 raise error_type('Unexpected error while fetching data')
 
@@ -873,7 +875,7 @@ class Fetcher:
             # (or the next highest offset in case the message was compacted)
             for i, msg in enumerate(messages):
                 if msg.offset < fetch_offset:
-                    log.debug("Skipping message offset: %s (expecting %s)",
+                    self._logger.debug("Skipping message offset: %s (expecting %s)",
                               msg.offset, fetch_offset)
                 else:
                     self.message_idx = i

@@ -16,9 +16,6 @@ from kafka.protocol.offset import OffsetResetStrategy
 from kafka.structs import TopicPartition
 from kafka.version import __version__
 
-log = logging.getLogger(__name__)
-
-
 class KafkaConsumer:
     """Consume records from a Kafka cluster.
 
@@ -314,10 +311,12 @@ class KafkaConsumer:
         'legacy_iterator': False, # enable to revert to < 1.4.7 iterator
         'kafka_client': KafkaClient,
         'coordinator': ConsumerCoordinator,
+        'logger': logging.getLogger(__name__)
     }
     DEFAULT_SESSION_TIMEOUT_MS_0_9 = 30000
 
     def __init__(self, *topics, **configs):
+
         # Only check for extra config keys in top-level class
         extra_configs = set(configs).difference(self.DEFAULT_CONFIG)
         if extra_configs:
@@ -325,11 +324,12 @@ class KafkaConsumer:
 
         self.config = copy.copy(self.DEFAULT_CONFIG)
         self.config.update(configs)
+        self._logger = self.config['logger']
 
         deprecated = {'smallest': 'earliest', 'largest': 'latest'}
         if self.config['auto_offset_reset'] in deprecated:
             new_config = deprecated[self.config['auto_offset_reset']]
-            log.warning('use auto_offset_reset=%s (%s is deprecated)',
+            self._logger.warning('use auto_offset_reset=%s (%s is deprecated)',
                         new_config, self.config['auto_offset_reset'])
             self.config['auto_offset_reset'] = new_config
 
@@ -358,7 +358,7 @@ class KafkaConsumer:
                 self.config['api_version'] = None
             else:
                 self.config['api_version'] = tuple(map(int, str_version.split('.')))
-            log.warning('use api_version=%s [tuple] -- "%s" as str is deprecated',
+            self._logger.warning('use api_version=%s [tuple] -- "%s" as str is deprecated',
                         str(self.config['api_version']), str_version)
 
         self._client = self.config['kafka_client'](metrics=self._metrics, **self.config)
@@ -459,7 +459,7 @@ class KafkaConsumer:
         """
         if self._closed:
             return
-        log.debug("Closing the KafkaConsumer.")
+        self._logger.debug("Closing the KafkaConsumer.")
         self._closed = True
         self._coordinator.close(autocommit=autocommit)
         self._metrics.close()
@@ -472,7 +472,7 @@ class KafkaConsumer:
             self.config['value_deserializer'].close()
         except AttributeError:
             pass
-        log.debug("The KafkaConsumer has closed.")
+        self._logger.debug("The KafkaConsumer has closed.")
 
     def commit_async(self, offsets=None, callback=None):
         """Commit offsets to kafka asynchronously, optionally firing callback.
@@ -503,7 +503,7 @@ class KafkaConsumer:
         assert self.config['group_id'] is not None, 'Requires group_id'
         if offsets is None:
             offsets = self._subscription.all_consumed_offsets()
-        log.debug("Committing offsets: %s", offsets)
+        self._logger.debug("Committing offsets: %s", offsets)
         future = self._coordinator.commit_offsets_async(
             offsets, callback=callback)
         return future
@@ -776,7 +776,7 @@ class KafkaConsumer:
         if not all([isinstance(p, TopicPartition) for p in partitions]):
             raise TypeError('partitions must be TopicPartition namedtuples')
         for partition in partitions:
-            log.debug("Pausing partition %s", partition)
+            self._logger.debug("Pausing partition %s", partition)
             self._subscription.pause(partition)
         # Because the iterator checks is_fetchable() on each iteration
         # we expect pauses to get handled automatically and therefore
@@ -800,7 +800,7 @@ class KafkaConsumer:
         if not all([isinstance(p, TopicPartition) for p in partitions]):
             raise TypeError('partitions must be TopicPartition namedtuples')
         for partition in partitions:
-            log.debug("Resuming partition %s", partition)
+            self._logger.debug("Resuming partition %s", partition)
             self._subscription.resume(partition)
 
     def seek(self, partition, offset):
@@ -826,7 +826,7 @@ class KafkaConsumer:
             raise TypeError('partition must be a TopicPartition namedtuple')
         assert isinstance(offset, int) and offset >= 0, 'Offset must be >= 0'
         assert partition in self._subscription.assigned_partitions(), 'Unassigned partition'
-        log.debug("Seeking to offset %s for partition %s", offset, partition)
+        self._logger.debug("Seeking to offset %s for partition %s", offset, partition)
         self._subscription.assignment[partition].seek(offset)
         if not self.config['legacy_iterator']:
             self._iterator = None
@@ -852,7 +852,7 @@ class KafkaConsumer:
                 assert p in self._subscription.assigned_partitions(), 'Unassigned partition'
 
         for tp in partitions:
-            log.debug("Seeking to beginning of partition %s", tp)
+            self._logger.debug("Seeking to beginning of partition %s", tp)
             self._subscription.need_offset_reset(tp, OffsetResetStrategy.EARLIEST)
         if not self.config['legacy_iterator']:
             self._iterator = None
@@ -878,7 +878,7 @@ class KafkaConsumer:
                 assert p in self._subscription.assigned_partitions(), 'Unassigned partition'
 
         for tp in partitions:
-            log.debug("Seeking to end of partition %s", tp)
+            self._logger.debug("Seeking to end of partition %s", tp)
             self._subscription.need_offset_reset(tp, OffsetResetStrategy.LATEST)
         if not self.config['legacy_iterator']:
             self._iterator = None
@@ -934,11 +934,11 @@ class KafkaConsumer:
             self._client.cluster.need_all_topic_metadata = True
             self._client.set_topics([])
             self._client.cluster.request_update()
-            log.debug("Subscribed to topic pattern: %s", pattern)
+            self._logger.debug("Subscribed to topic pattern: %s", pattern)
         else:
             self._client.cluster.need_all_topic_metadata = False
             self._client.set_topics(self._subscription.group_subscription())
-            log.debug("Subscribed to topic(s): %s", topics)
+            self._logger.debug("Subscribed to topic(s): %s", topics)
 
     def subscription(self):
         """Get the current topic subscription.
@@ -956,7 +956,7 @@ class KafkaConsumer:
         self._coordinator.close()
         self._client.cluster.need_all_topic_metadata = False
         self._client.set_topics([])
-        log.debug("Unsubscribed all topics or patterns and assigned partitions")
+        self._logger.debug("Unsubscribed all topics or patterns and assigned partitions")
         if not self.config['legacy_iterator']:
             self._iterator = None
 
@@ -1134,7 +1134,7 @@ class KafkaConsumer:
                 # outer function destroying the existing iterator/generator
                 # via self._iterator = None
                 if not self._subscription.is_fetchable(tp):
-                    log.debug("Not returning fetched records for partition %s"
+                    self._logger.debug("Not returning fetched records for partition %s"
                               " since it is no longer fetchable", tp)
                     break
                 self._subscription.assignment[tp].position = record.offset + 1
@@ -1171,7 +1171,7 @@ class KafkaConsumer:
             for msg in self._fetcher:
                 yield msg
                 if time.time() > timeout_at:
-                    log.debug("internal iterator timeout - breaking for poll")
+                    self._logger.debug("internal iterator timeout - breaking for poll")
                     break
                 self._client.poll(timeout_ms=0)
 

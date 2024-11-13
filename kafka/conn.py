@@ -212,7 +212,8 @@ class BrokerConnection:
         'sasl_plain_password': None,
         'sasl_kerberos_service_name': 'kafka',
         'sasl_kerberos_domain_name': None,
-        'sasl_oauth_token_provider': None
+        'sasl_oauth_token_provider': None,
+        'logger': None
     }
     SECURITY_PROTOCOLS = ('PLAINTEXT', 'SSL', 'SASL_PLAINTEXT', 'SASL_SSL')
 
@@ -228,6 +229,8 @@ class BrokerConnection:
         for key in self.config:
             if key in configs:
                 self.config[key] = configs[key]
+
+        self._logger = self.config['logger'].bind(logger_name="BrokerConnection") or logging.getLogger(__name__)
 
         if self.config['connection_timeout_ms'] is None:
             self.config['connection_timeout_ms'] = self.config['request_timeout_ms']
@@ -292,9 +295,9 @@ class BrokerConnection:
                                                     self.node_id)
 
     def _dns_lookup(self):
-        self._gai = dns_lookup(self.host, self.port, self.afi)
+        self._gai = dns_lookup(self._logger, self.host, self.port, self.afi)
         if not self._gai:
-            log.error('DNS lookup failed for %s:%i (%s)',
+            self._logger.error('DNS lookup failed for %s:%i (%s)',
                       self.host, self.port, self.afi)
             return False
         return True
@@ -347,19 +350,19 @@ class BrokerConnection:
                 self.close(Errors.KafkaConnectionError('DNS failure'))
                 return self.state
             else:
-                log.debug('%s: creating new socket', self)
+                self._logger.debug('%s: creating new socket', self)
                 assert self._sock is None
                 self._sock_afi, self._sock_addr = next_lookup
                 self._sock = socket.socket(self._sock_afi, socket.SOCK_STREAM)
 
             for option in self.config['socket_options']:
-                log.debug('%s: setting socket option %s', self, option)
+                self._logger.debug('%s: setting socket option %s', self, option)
                 self._sock.setsockopt(*option)
 
             self._sock.setblocking(False)
             self.state = ConnectionStates.CONNECTING
             self.config['state_change_callback'](self.node_id, self._sock, self)
-            log.info('%s: connecting to %s:%d [%s %s]', self, self.host,
+            self._logger.info('%s: connecting to %s:%d [%s %s]', self, self.host,
                      self.port, self._sock_addr, AFI_NAMES[self._sock_afi])
             self.last_activity = time.time()
 
@@ -374,23 +377,23 @@ class BrokerConnection:
 
             # Connection succeeded
             if not ret or ret == errno.EISCONN:
-                log.debug('%s: established TCP connection', self)
+                self._logger.debug('%s: established TCP connection', self)
 
                 if self.config['security_protocol'] in ('SSL', 'SASL_SSL'):
-                    log.debug('%s: initiating SSL handshake', self)
+                    self._logger.debug('%s: initiating SSL handshake', self)
                     # _wrap_ssl can alter the connection state -- disconnects on failure
                     self._wrap_ssl()
                     self.state = ConnectionStates.HANDSHAKE
                     self.config['state_change_callback'](self.node_id, self._sock, self)
 
                 elif self.config['security_protocol'] == 'SASL_PLAINTEXT':
-                    log.debug('%s: initiating SASL authentication', self)
+                    self._logger.debug('%s: initiating SASL authentication', self)
                     self.state = ConnectionStates.AUTHENTICATING
                     self.config['state_change_callback'](self.node_id, self._sock, self)
 
                 else:
                     # security_protocol PLAINTEXT
-                    log.info('%s: Connection complete.', self)
+                    self._logger.info('%s: Connection complete.', self)
                     self.state = ConnectionStates.CONNECTED
                     self._reset_reconnect_backoff()
                     self.config['state_change_callback'](self.node_id, self._sock, self)
@@ -399,7 +402,7 @@ class BrokerConnection:
             # Connection failed
             # WSAEINVAL == 10022, but errno.WSAEINVAL is not available on non-win systems
             elif ret not in (errno.EINPROGRESS, errno.EALREADY, errno.EWOULDBLOCK, 10022):
-                log.error('Connect attempt to %s returned error %s.'
+                self._logger.error('Connect attempt to %s returned error %s.'
                           ' Disconnecting.', self, ret)
                 errstr = errno.errorcode.get(ret, 'UNKNOWN')
                 self.close(Errors.KafkaConnectionError(f'{ret} {errstr}'))
@@ -411,12 +414,12 @@ class BrokerConnection:
 
         if self.state is ConnectionStates.HANDSHAKE:
             if self._try_handshake():
-                log.debug('%s: completed SSL handshake.', self)
+                self._logger.debug('%s: completed SSL handshake.', self)
                 if self.config['security_protocol'] == 'SASL_SSL':
-                    log.debug('%s: initiating SASL authentication', self)
+                    self._logger.debug('%s: initiating SASL authentication', self)
                     self.state = ConnectionStates.AUTHENTICATING
                 else:
-                    log.info('%s: Connection complete.', self)
+                    self._logger.info('%s: Connection complete.', self)
                     self.state = ConnectionStates.CONNECTED
                     self._reset_reconnect_backoff()
                 self.config['state_change_callback'](self.node_id, self._sock, self)
@@ -427,7 +430,7 @@ class BrokerConnection:
             if self._try_authenticate():
                 # _try_authenticate has side-effects: possibly disconnected on socket errors
                 if self.state is ConnectionStates.AUTHENTICATING:
-                    log.info('%s: Connection complete.', self)
+                    self._logger.info('%s: Connection complete.', self)
                     self.state = ConnectionStates.CONNECTED
                     self._reset_reconnect_backoff()
                     self.config['state_change_callback'](self.node_id, self._sock, self)
@@ -438,7 +441,7 @@ class BrokerConnection:
             # Connection timed out
             request_timeout = self.config['connection_timeout_ms'] / 1000.0
             if time.time() > request_timeout + self.last_activity:
-                log.error('Connection attempt to %s timed out', self)
+                self._logger.error('Connection attempt to %s timed out', self)
                 self.close(Errors.KafkaConnectionError('timeout'))
                 return self.state
 
@@ -447,7 +450,7 @@ class BrokerConnection:
     def _wrap_ssl(self):
         assert self.config['security_protocol'] in ('SSL', 'SASL_SSL')
         if self._ssl_context is None:
-            log.debug('%s: configuring default SSL Context', self)
+            self._logger.debug('%s: configuring default SSL Context', self)
             self._ssl_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)  # pylint: disable=no-member
             self._ssl_context.options |= ssl.OP_NO_SSLv2  # pylint: disable=no-member
             self._ssl_context.options |= ssl.OP_NO_SSLv3  # pylint: disable=no-member
@@ -455,15 +458,15 @@ class BrokerConnection:
             if self.config['ssl_check_hostname']:
                 self._ssl_context.check_hostname = True
             if self.config['ssl_cafile']:
-                log.info('%s: Loading SSL CA from %s', self, self.config['ssl_cafile'])
+                self._logger.info('%s: Loading SSL CA from %s', self, self.config['ssl_cafile'])
                 self._ssl_context.load_verify_locations(self.config['ssl_cafile'])
                 self._ssl_context.verify_mode = ssl.CERT_REQUIRED
             else:
-                log.info('%s: Loading system default SSL CAs from %s', self, ssl.get_default_verify_paths())
+                self._logger.info('%s: Loading system default SSL CAs from %s', self, ssl.get_default_verify_paths())
                 self._ssl_context.load_default_certs()
             if self.config['ssl_certfile'] and self.config['ssl_keyfile']:
-                log.info('%s: Loading SSL Cert from %s', self, self.config['ssl_certfile'])
-                log.info('%s: Loading SSL Key from %s', self, self.config['ssl_keyfile'])
+                self._logger.info('%s: Loading SSL Cert from %s', self, self.config['ssl_certfile'])
+                self._logger.info('%s: Loading SSL Key from %s', self, self.config['ssl_keyfile'])
                 self._ssl_context.load_cert_chain(
                     certfile=self.config['ssl_certfile'],
                     keyfile=self.config['ssl_keyfile'],
@@ -471,21 +474,21 @@ class BrokerConnection:
             if self.config['ssl_crlfile']:
                 if not hasattr(ssl, 'VERIFY_CRL_CHECK_LEAF'):
                     raise RuntimeError('This version of Python does not support ssl_crlfile!')
-                log.info('%s: Loading SSL CRL from %s', self, self.config['ssl_crlfile'])
+                self._logger.info('%s: Loading SSL CRL from %s', self, self.config['ssl_crlfile'])
                 self._ssl_context.load_verify_locations(self.config['ssl_crlfile'])
                 # pylint: disable=no-member
                 self._ssl_context.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
             if self.config['ssl_ciphers']:
-                log.info('%s: Setting SSL Ciphers: %s', self, self.config['ssl_ciphers'])
+                self._logger.info('%s: Setting SSL Ciphers: %s', self, self.config['ssl_ciphers'])
                 self._ssl_context.set_ciphers(self.config['ssl_ciphers'])
-        log.debug('%s: wrapping socket in ssl context', self)
+        self._logger.debug('%s: wrapping socket in ssl context', self)
         try:
             self._sock = self._ssl_context.wrap_socket(
                 self._sock,
                 server_hostname=self.host.rstrip("."),
                 do_handshake_on_connect=False)
         except ssl.SSLError as e:
-            log.exception('%s: Failed to wrap socket in SSLContext!', self)
+            self._logger.exception('%s: Failed to wrap socket in SSLContext!', self)
             self.close(e)
 
     def _try_handshake(self):
@@ -497,7 +500,7 @@ class BrokerConnection:
         except (SSLWantReadError, SSLWantWriteError):
             pass
         except (SSLZeroReturnError, ConnectionError, TimeoutError, SSLEOFError, ssl.SSLError, OSError) as e:
-            log.warning('SSL connection closed by server during handshake.')
+            self._logger.warning('SSL connection closed by server during handshake.')
             self.close(Errors.KafkaConnectionError('SSL connection closed by server during handshake'))
         # Other SSLErrors will be raised to user
 
@@ -647,7 +650,7 @@ class BrokerConnection:
             self._reconnect_backoff = min(self._reconnect_backoff, self.config['reconnect_backoff_max_ms'])
             self._reconnect_backoff *= uniform(0.8, 1.2)
             self._reconnect_backoff /= 1000.0
-            log.debug('%s: reconnect backoff %s after %s failures', self, self._reconnect_backoff, self._failures)
+            self._logger.debug('%s: reconnect backoff %s after %s failures', self, self._reconnect_backoff, self._failures)
 
     def _close_socket(self):
         if hasattr(self, '_sock') and self._sock is not None:
@@ -670,7 +673,7 @@ class BrokerConnection:
         with self._lock:
             if self.state is ConnectionStates.DISCONNECTED:
                 return
-            log.log(logging.ERROR if error else logging.INFO, '%s: Closing connection. %s', self, error or '')
+            self._logger.log(logging.ERROR if error else logging.INFO, '%s: Closing connection. %s', self, error or '')
             self._update_reconnect_backoff()
             self._sasl_auth_future = None
             self._protocol = KafkaProtocol(
@@ -723,7 +726,7 @@ class BrokerConnection:
 
             correlation_id = self._protocol.send_request(request)
 
-            log.debug('%s Request %d: %s', self, correlation_id, request)
+            self._logger.debug('%s Request %d: %s', self, correlation_id, request)
             if request.expect_response():
                 sent_time = time.time()
                 assert correlation_id not in self.in_flight_requests, 'Correlation ID already in-flight!'
@@ -756,7 +759,7 @@ class BrokerConnection:
             return True
 
         except (ConnectionError, TimeoutError) as e:
-            log.exception("Error sending request data to %s", self)
+            self._logger.exception("Error sending request data to %s", self)
             error = Errors.KafkaConnectionError("{}: {}".format(self, e))
             self.close(error=error)
             return False
@@ -789,7 +792,7 @@ class BrokerConnection:
             return len(self._send_buffer) == 0
 
         except (ConnectionError, TimeoutError, Exception) as e:
-            log.exception("Error sending request data to %s", self)
+            self._logger.exception("Error sending request data to %s", self)
             error = Errors.KafkaConnectionError("{}: {}".format(self, e))
             self.close(error=error)
             return False
@@ -806,7 +809,7 @@ class BrokerConnection:
         """
         responses = self._recv()
         if not responses and self.requests_timed_out():
-            log.warning('%s timed out after %s ms. Closing connection.',
+            self._logger.warning('%s timed out after %s ms. Closing connection.',
                         self, self.config['request_timeout_ms'])
             self.close(error=Errors.RequestTimedOutError(
                 'Request timed out after %s ms' %
@@ -825,7 +828,7 @@ class BrokerConnection:
             if self._sensors:
                 self._sensors.request_time.record(latency_ms)
 
-            log.debug('%s Response %d (%s ms): %s', self, correlation_id, latency_ms, response)
+            self._logger.debug('%s Response %d (%s ms): %s', self, correlation_id, latency_ms, response)
             responses[i] = (response, future)
 
         return responses
@@ -836,7 +839,7 @@ class BrokerConnection:
         err = None
         with self._lock:
             if not self._can_send_recv():
-                log.warning('%s cannot recv: socket not connected', self)
+                self._logger.warning('%s cannot recv: socket not connected', self)
                 return ()
 
             while len(recvd) < self.config['sock_chunk_buffer_count']:
@@ -847,7 +850,7 @@ class BrokerConnection:
                     # but if the socket is disconnected, we will get empty data
                     # without an exception raised
                     if not data:
-                        log.error('%s: socket disconnected', self)
+                        self._logger.error('%s: socket disconnected', self)
                         err = Errors.KafkaConnectionError('socket disconnected')
                         break
                     else:
@@ -856,7 +859,7 @@ class BrokerConnection:
                 except (SSLWantReadError, SSLWantWriteError):
                     break
                 except (ConnectionError, TimeoutError) as e:
-                    log.exception('%s: Error receiving network data'
+                    self._logger.exception('%s: Error receiving network data'
                                   ' closing socket', self)
                     err = Errors.KafkaConnectionError(e)
                     break
@@ -954,7 +957,7 @@ class BrokerConnection:
         Returns: version tuple, i.e. (0, 10), (0, 9), (0, 8, 2), ...
         """
         timeout_at = time.time() + timeout
-        log.info('Probing node %s broker version', self.node_id)
+        self._logger.info('Probing node %s broker version', self.node_id)
         # Monkeypatch some connection configurations to avoid timeouts
         override_config = {
             'request_timeout_ms': timeout * 1000,
@@ -1016,8 +1019,8 @@ class BrokerConnection:
                     # by looking at ApiVersionResponse
                     api_versions = self._handle_api_version_response(f.value)
                     version = self._infer_broker_version_from_api_versions(api_versions)
-                log.info('Broker version identified as %s', '.'.join(map(str, version)))
-                log.info('Set configuration api_version=%s to skip auto'
+                self._logger.info('Broker version identified as %s', '.'.join(map(str, version)))
+                self._logger.info('Set configuration api_version=%s to skip auto'
                          ' check_version requests on startup', version)
                 break
 
@@ -1039,7 +1042,7 @@ class BrokerConnection:
                     pass
                 else:
                     assert isinstance(f.exception.args[0], ConnectionError)
-            log.info("Broker is not v%s -- it did not recognize %s",
+            self._logger.info("Broker is not v%s -- it did not recognize %s",
                      version, request.__class__.__name__)
         else:
             reset_override_configs()
@@ -1217,7 +1220,7 @@ def get_ip_port_afi(host_and_port_str):
                 socket.inet_pton(socket.AF_INET6, host_and_port_str)
                 return host_and_port_str, DEFAULT_KAFKA_PORT, socket.AF_INET6
             except AttributeError:
-                log.warning('socket.inet_pton not available on this platform.'
+                self._logger.warning('socket.inet_pton not available on this platform.'
                             ' consider `pip install win_inet_pton`')
                 pass
             except (ValueError, OSError):
@@ -1261,7 +1264,7 @@ def is_inet_4_or_6(gai):
     return gai[0] in (socket.AF_INET, socket.AF_INET6)
 
 
-def dns_lookup(host, port, afi=socket.AF_UNSPEC):
+def dns_lookup(logger, host, port, afi=socket.AF_UNSPEC):
     """Returns a list of getaddrinfo structs, optionally filtered to an afi (ipv4 / ipv6)"""
     # XXX: all DNS functions in Python are blocking. If we really
     # want to be non-blocking here, we need to use a 3rd-party
@@ -1273,7 +1276,7 @@ def dns_lookup(host, port, afi=socket.AF_UNSPEC):
                            socket.getaddrinfo(host, port, afi,
                                               socket.SOCK_STREAM)))
     except socket.gaierror as ex:
-        log.warning('DNS lookup failed for %s:%d,'
+        logger.warning('DNS lookup failed for %s:%d,'
                     ' exception was %s. Is your'
                     ' advertised.listeners (called'
                     ' advertised.host.name before Kafka 9)'

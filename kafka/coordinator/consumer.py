@@ -40,7 +40,7 @@ class ConsumerCoordinator(BaseCoordinator):
         'metric_group_prefix': 'consumer'
     }
 
-    def __init__(self, client, subscription, metrics, **configs):
+    def __init__(self, client, subscription, metrics, logger, **configs):
         """Initialize the coordination manager.
 
         Keyword Arguments:
@@ -82,13 +82,14 @@ class ConsumerCoordinator(BaseCoordinator):
                 True the only way to receive records from an internal topic is
                 subscribing to it. Requires 0.10+. Default: True
         """
-        super().__init__(client, metrics, **configs)
+        super().__init__(client, metrics, logger, **configs)
 
         self.config = copy.copy(self.DEFAULT_CONFIG)
         for key in self.config:
             if key in configs:
                 self.config[key] = configs[key]
 
+        self._logger = logger.bind(logger_name="ConsumerCoordinator")
         self._subscription = subscription
         self._is_leader = False
         self._joined_subscription = set()
@@ -114,12 +115,12 @@ class ConsumerCoordinator(BaseCoordinator):
 
         if self.config['enable_auto_commit']:
             if self.config['api_version'] < (0, 8, 1):
-                log.warning('Broker version (%s) does not support offset'
+                self._logger.warning('Broker version (%s) does not support offset'
                             ' commits; disabling auto-commit.',
                             self.config['api_version'])
                 self.config['enable_auto_commit'] = False
             elif self.config['group_id'] is None:
-                log.warning('group_id is None: disabling auto-commit.')
+                self._logger.warning('group_id is None: disabling auto-commit.')
                 self.config['enable_auto_commit'] = False
             else:
                 self.next_auto_commit_deadline = time.time() + self.auto_commit_interval
@@ -233,7 +234,7 @@ class ConsumerCoordinator(BaseCoordinator):
         try:
             self._subscription.assign_from_subscribed(assignment.partitions())
         except ValueError as e:
-            log.warning("%s. Probably due to a deleted topic. Requesting Re-join" % e)
+            self._logger.warning("%s. Probably due to a deleted topic. Requesting Re-join" % e)
             self.request_rejoin()
 
         # give the assignor a chance to update internal state
@@ -246,7 +247,7 @@ class ConsumerCoordinator(BaseCoordinator):
         self.next_auto_commit_deadline = time.time() + self.auto_commit_interval
 
         assigned = set(self._subscription.assigned_partitions())
-        log.info("Setting newly assigned partitions %s for group %s",
+        self._logger.info("Setting newly assigned partitions %s for group %s",
                  assigned, self.group_id)
 
         # execute the user's callback after rebalance
@@ -254,7 +255,7 @@ class ConsumerCoordinator(BaseCoordinator):
             try:
                 self._subscription.listener.on_partitions_assigned(assigned)
             except Exception:
-                log.exception("User provided listener %s for group %s"
+                self._logger.exception("User provided listener %s for group %s"
                               " failed on partition assignment: %s",
                               self._subscription.listener, self.group_id,
                               assigned)
@@ -336,13 +337,13 @@ class ConsumerCoordinator(BaseCoordinator):
         self._is_leader = True
         self._assignment_snapshot = self._metadata_snapshot
 
-        log.debug("Performing assignment for group %s using strategy %s"
+        self._logger.debug("Performing assignment for group %s using strategy %s"
                   " with subscriptions %s", self.group_id, assignor.name,
                   member_metadata)
 
         assignments = assignor.assign(self._cluster, member_metadata)
 
-        log.debug("Finished assignment for group %s: %s", self.group_id, assignments)
+        self._logger.debug("Finished assignment for group %s: %s", self.group_id, assignments)
 
         group_assignment = {}
         for member_id, assignment in assignments.items():
@@ -354,14 +355,14 @@ class ConsumerCoordinator(BaseCoordinator):
         self._maybe_auto_commit_offsets_sync()
 
         # execute the user's callback before rebalance
-        log.info("Revoking previously assigned partitions %s for group %s",
+        self._logger.info("Revoking previously assigned partitions %s for group %s",
                  self._subscription.assigned_partitions(), self.group_id)
         if self._subscription.listener:
             try:
                 revoked = set(self._subscription.assigned_partitions())
                 self._subscription.listener.on_partitions_revoked(revoked)
             except Exception:
-                log.exception("User provided subscription listener %s"
+                self._logger.exception("User provided subscription listener %s"
                               " for group %s failed on_partitions_revoked",
                               self._subscription.listener, self.group_id)
 
@@ -541,11 +542,11 @@ class ConsumerCoordinator(BaseCoordinator):
             except (Errors.UnknownMemberIdError,
                     Errors.IllegalGenerationError,
                     Errors.RebalanceInProgressError):
-                log.warning("Offset commit failed: group membership out of date"
+                self._logger.warning("Offset commit failed: group membership out of date"
                             " This is likely to cause duplicate message"
                             " delivery.")
             except Exception:
-                log.exception("Offset commit failed: This is likely to cause"
+                self._logger.exception("Offset commit failed: This is likely to cause"
                               " duplicate message delivery")
 
     def _send_offset_commit_request(self, offsets):
@@ -567,7 +568,7 @@ class ConsumerCoordinator(BaseCoordinator):
         assert all(map(lambda v: isinstance(v, OffsetAndMetadata),
                        offsets.values()))
         if not offsets:
-            log.debug('No offsets to commit')
+            self._logger.debug('No offsets to commit')
             return Future().success(None)
 
         node_id = self.coordinator()
@@ -633,7 +634,7 @@ class ConsumerCoordinator(BaseCoordinator):
             #   pylint to stop complaining.
             raise Exception(f"Unsupported Broker API: {self.config['api_version']}")
 
-        log.debug("Sending offset-commit request with %s for group %s to %s",
+        self._logger.debug("Sending offset-commit request with %s for group %s to %s",
                   offsets, self.group_id, node_id)
 
 
@@ -655,12 +656,12 @@ class ConsumerCoordinator(BaseCoordinator):
 
                 error_type = Errors.for_code(error_code)
                 if error_type is Errors.NoError:
-                    log.debug("Group %s committed offset %s for partition %s",
+                    self._logger.debug("Group %s committed offset %s for partition %s",
                               self.group_id, offset, tp)
                     if self._subscription.is_assigned(tp):
                         self._subscription.assignment[tp].committed = offset
                 elif error_type is Errors.GroupAuthorizationFailedError:
-                    log.error("Not authorized to commit offsets for group %s",
+                    self._logger.error("Not authorized to commit offsets for group %s",
                               self.group_id)
                     future.failure(error_type(self.group_id))
                     return
@@ -669,20 +670,20 @@ class ConsumerCoordinator(BaseCoordinator):
                 elif error_type in (Errors.OffsetMetadataTooLargeError,
                                     Errors.InvalidCommitOffsetSizeError):
                     # raise the error to the user
-                    log.debug("OffsetCommit for group %s failed on partition %s"
+                    self._logger.debug("OffsetCommit for group %s failed on partition %s"
                               " %s", self.group_id, tp, error_type.__name__)
                     future.failure(error_type())
                     return
                 elif error_type is Errors.GroupLoadInProgressError:
                     # just retry
-                    log.debug("OffsetCommit for group %s failed: %s",
+                    self._logger.debug("OffsetCommit for group %s failed: %s",
                               self.group_id, error_type.__name__)
                     future.failure(error_type(self.group_id))
                     return
                 elif error_type in (Errors.GroupCoordinatorNotAvailableError,
                                     Errors.NotCoordinatorForGroupError,
                                     Errors.RequestTimedOutError):
-                    log.debug("OffsetCommit for group %s failed: %s",
+                    self._logger.debug("OffsetCommit for group %s failed: %s",
                               self.group_id, error_type.__name__)
                     self.coordinator_dead(error_type())
                     future.failure(error_type(self.group_id))
@@ -692,20 +693,20 @@ class ConsumerCoordinator(BaseCoordinator):
                                     Errors.RebalanceInProgressError):
                     # need to re-join group
                     error = error_type(self.group_id)
-                    log.debug("OffsetCommit for group %s failed: %s",
+                    self._logger.debug("OffsetCommit for group %s failed: %s",
                               self.group_id, error)
                     self.reset_generation()
                     future.failure(Errors.CommitFailedError())
                     return
                 else:
-                    log.error("Group %s failed to commit partition %s at offset"
+                    self._logger.error("Group %s failed to commit partition %s at offset"
                               " %s: %s", self.group_id, tp, offset,
                               error_type.__name__)
                     future.failure(error_type())
                     return
 
         if unauthorized_topics:
-            log.error("Not authorized to commit to topics %s for group %s",
+            self._logger.error("Not authorized to commit to topics %s for group %s",
                       unauthorized_topics, self.group_id)
             future.failure(Errors.TopicAuthorizationFailedError(unauthorized_topics))
         else:
@@ -734,11 +735,11 @@ class ConsumerCoordinator(BaseCoordinator):
 
         # Verify node is ready
         if not self._client.ready(node_id):
-            log.debug("Node %s not ready -- failing offset fetch request",
+            self._logger.debug("Node %s not ready -- failing offset fetch request",
                       node_id)
             return Future().failure(Errors.NodeNotReadyError)
 
-        log.debug("Group %s fetching committed offsets for partitions: %s",
+        self._logger.debug("Group %s fetching committed offsets for partitions: %s",
                   self.group_id, partitions)
         # construct the request
         topic_partitions = collections.defaultdict(set)
@@ -771,7 +772,7 @@ class ConsumerCoordinator(BaseCoordinator):
                 error_type = Errors.for_code(error_code)
                 if error_type is not Errors.NoError:
                     error = error_type()
-                    log.debug("Group %s failed to fetch offset for partition"
+                    self._logger.debug("Group %s failed to fetch offset for partition"
                               " %s: %s", self.group_id, tp, error)
                     if error_type is Errors.GroupLoadInProgressError:
                         # just retry
@@ -781,12 +782,12 @@ class ConsumerCoordinator(BaseCoordinator):
                         self.coordinator_dead(error_type())
                         future.failure(error)
                     elif error_type is Errors.UnknownTopicOrPartitionError:
-                        log.warning("OffsetFetchRequest -- unknown topic %s"
+                        self._logger.warning("OffsetFetchRequest -- unknown topic %s"
                                     " (have you committed any offsets yet?)",
                                     topic)
                         continue
                     else:
-                        log.error("Unknown error fetching offsets for %s: %s",
+                        self._logger.error("Unknown error fetching offsets for %s: %s",
                                   tp, error)
                         future.failure(error)
                     return
@@ -795,22 +796,22 @@ class ConsumerCoordinator(BaseCoordinator):
                     # (-1 indicates no committed offset to fetch)
                     offsets[tp] = OffsetAndMetadata(offset, metadata)
                 else:
-                    log.debug("Group %s has no committed offset for partition"
+                    self._logger.debug("Group %s has no committed offset for partition"
                               " %s", self.group_id, tp)
         future.success(offsets)
 
     def _default_offset_commit_callback(self, offsets, exception):
         if exception is not None:
-            log.error("Offset commit failed: %s", exception)
+            self._logger.error("Offset commit failed: %s", exception)
 
     def _commit_offsets_async_on_complete(self, offsets, exception):
         if exception is not None:
-            log.warning("Auto offset commit failed for group %s: %s",
+            self._logger.warning("Auto offset commit failed for group %s: %s",
                         self.group_id, exception)
             if getattr(exception, 'retriable', False):
                 self.next_auto_commit_deadline = min(time.time() + self.config['retry_backoff_ms'] / 1000, self.next_auto_commit_deadline)
         else:
-            log.debug("Completed autocommit of offsets %s for group %s",
+            self._logger.debug("Completed autocommit of offsets %s for group %s",
                       offsets, self.group_id)
 
     def _maybe_auto_commit_offsets_async(self):
